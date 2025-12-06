@@ -592,12 +592,33 @@ class MirrorReproject(bpy.types.Operator):
             f"Refine mirror applied as new layer (material id {new_material_id}). Temporary camera removed."
         )
         return {'FINISHED'}
+    
+    def _schedule_delete_camera_later(self, cam_name: str):
+        """Delete the temporary camera after StableGen reprojection finishes."""
+        import bpy
+
+        def _delete():
+            # Wait until the generate/reproject operator is done
+            if ComfyUIGenerate._is_running:
+                return 0.5  # check again in 0.5 seconds
+
+            cam = bpy.data.objects.get(cam_name)
+            if cam is not None:
+                try:
+                    bpy.data.objects.remove(cam, do_unlink=True)
+                    print(f"[MirrorReproject] Deleted temporary camera '{cam_name}'")
+                except Exception as exc:
+                    print(f"[MirrorReproject] Failed to delete camera '{cam_name}': {exc}")
+            return None  # stop the timer
+
+        bpy.app.timers.register(_delete, first_interval=1.0)
 
     def _do_standard_mirror(self, context, to_texture):
         """
-        Original behavior: mirror within the current material id.
-        For standard / non-refine workflows, we mirror the image and camera,
-        then call project_image directly (no Reproject operator).
+        Standard / non-refine workflow:
+        - Mirror within the current material id.
+        - Mirror the image for the new camera on disk.
+        - Then let the existing Reproject operator do its thing.
         """
         scene = context.scene
 
@@ -640,11 +661,6 @@ class MirrorReproject(bpy.types.Operator):
                 {'ERROR'},
                 f"No generated image found for active camera index {src_cam_idx} at:\n{src_path}"
             )
-            # Clean up the temp camera if we bail early
-            try:
-                bpy.data.objects.remove(mir_cam, do_unlink=True)
-            except Exception:
-                pass
             return {'CANCELLED'}
 
         dst_path = get_file_path(
@@ -656,21 +672,27 @@ class MirrorReproject(bpy.types.Operator):
         print(f"[MirrorReproject] Standard mirror image\n  {src_path}\n-> {dst_path}")
         self._mirror_image_file(src_path, dst_path)
 
-        # 5) Project back onto the meshes directly for this material id
-        #    (this is the same core projection function used by the generate operator)
-        project_image(context, to_texture, base_id)
-
-        # 6) Delete the temporary mirrored camera now that projection is done
+        # 5) Hand off to the existing Reproject operator,
+        #    which will rebuild the compare nodes / blending / UV assignment.
         try:
-            bpy.data.objects.remove(mir_cam, do_unlink=True)
-        except Exception:
-            pass
+            bpy.ops.object.stablegen_reproject('INVOKE_DEFAULT')
+        except Exception as exc:
+            self.report(
+                {'ERROR'},
+                f"Failed to start StableGen reprojection after mirroring: {exc}"
+            )
+            return {'CANCELLED'}
+
+        # 6) Schedule deletion of the temporary mirrored camera
+        self._schedule_delete_camera_later(mir_cam.name)
 
         self.report(
             {'INFO'},
-            "Standard mirror applied and temporary camera removed."
+            f"Standard mirror: created camera '{mir_cam.name}', mirrored image, "
+            f"and started reprojection (camera will be removed afterwards)."
         )
         return {'FINISHED'}
+
 
 
     def execute(self, context):
