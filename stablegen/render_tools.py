@@ -96,80 +96,149 @@ def apply_vignette_to_mask(mask_file_path, feather_width=0.15, gamma=1.0):
 
 def apply_uv_inpaint_texture(context, obj, baked_image_path):
     """
-    Inserts a baked texture into the *ProjectionMaterial* by replacing the
-    LAST camera MixRGB's Color2 input. This allows refinement to continue
-    without node bloat.
+    Apply a UV inpainted/baked texture to the active material.
+
+    Priority:
+      1) StableGen projection chain: replace LAST MixRGB with "Projection" in name (Color2).
+      2) Fallback: traverse from Material Output and find a suitable MIX_RGB (Color2 unlinked
+         or linked from TEX_IMAGE), then replace that (Color2).
+
+    In both cases:
+      - Insert TexImage + UVMap (first non-ProjectionUV layer) feeding Color2.
+      - Remove existing Color2 links.
+      - If replacing a projection input, also remove the old TexImage node and orphaned image.
     """
 
     mat = obj.active_material
-    if not mat or not mat.use_nodes:
+    if not mat or not mat.use_nodes or not mat.node_tree:
         print("[StableGen] No active material or no node tree.")
         return
 
     nodes = mat.node_tree.nodes
     links = mat.node_tree.links
 
+    # -----------------------------
     # Load baked image
+    # -----------------------------
     try:
         img = bpy.data.images.load(baked_image_path)
     except Exception as e:
-        print("Failed to load baked image", baked_image_path, e)
+        print("[StableGen] Failed to load baked image", baked_image_path, e)
         return
 
-    # -------------------------------------------------------------------
-    # 1. Find the last camera MixRGB in the projection chain
-    # -------------------------------------------------------------------
-    # StableGen always names projection nodes with "Projection" prefix.
-    mix_nodes = [n for n in nodes if n.type == 'MIX_RGB' and "Projection" in n.name]
+    # -----------------------------
+    # Helpers
+    # -----------------------------
+    def pick_uv_name():
+        uv_layers = getattr(obj.data, "uv_layers", None)
+        if not uv_layers or len(uv_layers) == 0:
+            return None
+        for uv_layer in uv_layers:
+            if not uv_layer.name.startswith("ProjectionUV"):
+                return uv_layer.name
+        return uv_layers.active.name
 
-    if not mix_nodes:
-        print("[StableGen] No MixRGB projection nodes found.")
+    def clear_color2_links(mix_node, cleanup_teximage=False):
+        """Remove links to Color2. Optionally remove upstream TexImage nodes & orphaned images."""
+        for link in list(mix_node.inputs["Color2"].links):
+            src = link.from_node
+            links.remove(link)
+
+            if cleanup_teximage and src and src.type == "TEX_IMAGE":
+                old_img = src.image
+                try:
+                    nodes.remove(src)
+                except Exception:
+                    pass
+                if old_img and old_img.users == 0:
+                    try:
+                        bpy.data.images.remove(old_img)
+                    except Exception:
+                        pass
+
+    def inject_tex_uv_into_color2(mix_node):
+        """Create TexImage+UVMap and connect into mix_node Color2."""
+        tex = nodes.new("ShaderNodeTexImage")
+        tex.image = img
+        tex.label = "BakedProjection"
+        tex.location = (mix_node.location[0] - 300, mix_node.location[1])
+
+        uv = nodes.new("ShaderNodeUVMap")
+        uv_name = pick_uv_name()
+        if uv_name:
+            uv.uv_map = uv_name
+        uv.location = (tex.location[0] - 300, tex.location[1] - 200)
+
+        links.new(uv.outputs["UV"], tex.inputs["Vector"])
+        links.new(tex.outputs["Color"], mix_node.inputs["Color2"])
+
+    # ============================================================
+    # 1) StableGen projection chain path
+    # ============================================================
+    proj_mix_nodes = [n for n in nodes if n.type == "MIX_RGB" and "Projection" in n.name]
+    if proj_mix_nodes:
+        mix_node = sorted(proj_mix_nodes, key=lambda n: n.name)[-1]
+
+        # Remove previous projection input, clean up old TexImage nodes
+        clear_color2_links(mix_node, cleanup_teximage=True)
+
+        # Inject baked texture
+        inject_tex_uv_into_color2(mix_node)
+
+        print(f"[StableGen] Injected baked projection into projection chain ({mix_node.name}) on {obj.name}")
         return
 
-    # The last projection node is the newest camera layer
-    mix_node = sorted(mix_nodes, key=lambda n: n.name)[-1]
+    # ============================================================
+    # 2) Fallback traversal path (your original logic)
+    # ============================================================
+    output_node = next((n for n in nodes if n.type == "OUTPUT_MATERIAL"), None)
+    if not output_node or not output_node.inputs["Surface"].links:
+        print("[StableGen] No Material Output surface link found for fallback.")
+        return
 
-    # -------------------------------------------------------------------
-    # 2. Remove previous camera projection input (Color2)
-    # -------------------------------------------------------------------
-    # Remove all existing links
-    for link in list(mix_node.inputs["Color2"].links):
-        src = link.from_node
-        links.remove(link)
-        # If it was a TexImage, clean it up
-        if src.type == "TEX_IMAGE":
-            old_img = src.image
-            nodes.remove(src)
-            if old_img and old_img.users == 0:
-                bpy.data.images.remove(old_img)
+    before_output = output_node.inputs["Surface"].links[0].from_node
 
-    # -------------------------------------------------------------------
-    # 3. Add new Texture + UVMap nodes supplying the baked projection
-    # -------------------------------------------------------------------
-    tex = nodes.new("ShaderNodeTexImage")
-    tex.image = img
-    tex.label = "BakedProjection"
-    tex.location = (mix_node.location[0] - 300, mix_node.location[1])
+    if before_output.type == "BSDF_PRINCIPLED":
+        # Follow: Output.Surface -> Principled -> Base Color -> upstream node
+        base_color = before_output.inputs.get("Base Color")
+        if base_color and base_color.links:
+            current_node = base_color.links[0].from_node
+        else:
+            current_node = None
+    else:
+        current_node = before_output
 
-    uv = nodes.new("ShaderNodeUVMap")
+    mix_node = None
+    visited = set()
 
-    # Use first non-ProjectionUV layer
-    uv_name = None
-    for uv_layer in obj.data.uv_layers:
-        if not uv_layer.name.startswith("ProjectionUV"):
-            uv_name = uv_layer.name
-            break
-    if not uv_name:
-        uv_name = obj.data.uv_layers.active.name
+    while current_node and current_node.as_pointer() not in visited:
+        visited.add(current_node.as_pointer())
 
-    uv.uv_map = uv_name
-    uv.location = (tex.location[0] - 250, tex.location[1] - 100)
+        if current_node.type == "MIX_RGB":
+            c2 = current_node.inputs.get("Color2")
+            if c2:
+                if (not c2.is_linked) or (c2.is_linked and c2.links and c2.links[0].from_node.type == "TEX_IMAGE"):
+                    mix_node = current_node
+                    break
 
-    # Connect nodes
-    links.new(uv.outputs["UV"], tex.inputs["Vector"])
-    links.new(tex.outputs["Color"], mix_node.inputs["Color2"])
+        c2 = current_node.inputs.get("Color2")
+        if c2 and c2.links:
+            current_node = c2.links[0].from_node
+        else:
+            current_node = None
 
-    print(f"[StableGen] Injected baked projection into {mat.name} on {obj.name}")
+    if not mix_node:
+        print("[StableGen] No suitable fallback MixRGB node found.")
+        return
+
+    # Remove any existing links on Color2 (fallback does NOT aggressively delete nodes/images)
+    clear_color2_links(mix_node, cleanup_teximage=False)
+
+    # Insert baked texture + UVMap
+    inject_tex_uv_into_color2(mix_node)
+
+    print(f"[StableGen] Injected baked projection into fallback chain ({mix_node.name}) on {obj.name}")
+
 
 def flatten_projection_material_for_refine(context, obj, baked_image_path):
     """
