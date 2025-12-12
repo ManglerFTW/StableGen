@@ -20,6 +20,7 @@ import math
 import colorsys
 
 import mathutils
+from mathutils import Vector
 
 from .util.helpers import prompt_text, prompt_text_img2img, prompt_text_qwen_image_edit # pylint: disable=relative-beyond-top-level
 from .render_tools import export_emit_image, export_visibility, export_canny, bake_texture, prepare_baking, unwrap # pylint: disable=relative-beyond-top-level
@@ -325,23 +326,34 @@ def upload_image_to_comfyui(server_address, image_path, image_type="input"):
 
     return None
 
-def mirror_camera_matrix_x(cam: bpy.types.Object) -> mathutils.Matrix:
+def _build_mirrored_camera_matrix(
+    cam: bpy.types.Object,
+    mirror_x: bool,
+    mirror_y: bool,
+    mirror_z: bool,
+) -> mathutils.Matrix:
     """
-    Mirror a camera across the global X=0 plane, but rebuild the rotation
-    so we don't end up with negative scale / flipped handedness.
+    Mirror a camera across the selected global axes (X=0, Y=0, Z=0 planes),
+    then rebuild a proper rotation so we don't end up with negative scale
+    / flipped handedness.
     """
     m = cam.matrix_world.copy()
     loc = m.to_translation()
     basis = m.to_3x3()
 
     # Camera conventions: looks along local -Z, local +Y is "up"
-    forward = -(basis @ mathutils.Vector((0.0, 0.0, 1.0)))  # world-space view direction
-    up      =  (basis @ mathutils.Vector((0.0, 1.0, 0.0)))  # world-space up
+    forward = -(basis @ Vector((0.0, 0.0, 1.0)))  # world-space view dir
+    up      =  (basis @ Vector((0.0, 1.0, 0.0)))  # world-space up
 
-    # Mirror position & directions across X=0 (YZ plane)
-    loc_m = mathutils.Vector((-loc.x,  loc.y,  loc.z))
-    f_m   = mathutils.Vector((-forward.x, forward.y, forward.z))
-    u_m   = mathutils.Vector((-up.x,      up.y,      up.z))
+    # Reflection factors per axis
+    sx = -1.0 if mirror_x else 1.0
+    sy = -1.0 if mirror_y else 1.0
+    sz = -1.0 if mirror_z else 1.0
+
+    # Apply reflection to position and direction vectors
+    loc_m = Vector((sx * loc.x, sy * loc.y, sz * loc.z))
+    f_m   = Vector((sx * forward.x, sy * forward.y, sz * forward.z))
+    u_m   = Vector((sx * up.x,      sy * up.y,      sz * up.z))
 
     f = f_m.normalized()
     u0 = u_m.normalized()
@@ -350,7 +362,7 @@ def mirror_camera_matrix_x(cam: bpy.types.Object) -> mathutils.Matrix:
     r = f.cross(u0)
     if r.length < 1e-6:
         # Degenerate case: fall back to world Z as "up"
-        r = f.cross(mathutils.Vector((0.0, 0.0, 1.0)))
+        r = f.cross(Vector((0.0, 0.0, 1.0)))
     r.normalize()
     u = r.cross(f).normalized()
 
@@ -359,6 +371,15 @@ def mirror_camera_matrix_x(cam: bpy.types.Object) -> mathutils.Matrix:
     ori4 = ori3.to_4x4()
     ori4.translation = loc_m
     return ori4
+
+
+def mirror_camera_matrix_x(cam: bpy.types.Object) -> mathutils.Matrix:
+    """
+    Convenience wrapper: mirror a camera across the global X=0 plane.
+    Uses the shared helper to avoid code duplication.
+    """
+    return _build_mirrored_camera_matrix(cam, mirror_x=True, mirror_y=False, mirror_z=False)
+
 
 class MirrorReproject(bpy.types.Operator):
     """Duplicate & mirror the last projection camera and image.
@@ -377,28 +398,29 @@ class MirrorReproject(bpy.types.Operator):
     @classmethod
     def poll(cls, context):
         # Same checks as Reproject
-        if context.scene.output_timestamp == "":
+        scene = context.scene
+        if scene.output_timestamp == "":
             return False
 
-        operator = None
-        for window in context.window_manager.windows:
-            for op in window.modal_operators:
-                if (
-                    op.bl_idname == 'OBJECT_OT_add_cameras'
-                    or op.bl_idname == 'OBJECT_OT_bake_textures'
-                    or op.bl_idname == 'OBJECT_OT_collect_camera_prompts'
-                    or op.bl_idname == 'OBJECT_OT_test_stable'
-                    or op.bl_idname == 'OBJECT_OT_stablegen_reproject'
-                    or op.bl_idname == 'OBJECT_OT_stablegen_regenerate'
-                    or op.bl_idname == 'OBJECT_OT_stablegen_mirror_reproject'
-                    or context.scene.generation_status == 'waiting'
-                ):
-                    operator = op
-                    break
-            if operator:
-                break
-        if operator:
+        if scene.generation_status == 'waiting':
             return False
+
+        blocked_ids = {
+            'OBJECT_OT_add_cameras',
+            'OBJECT_OT_bake_textures',
+            'OBJECT_OT_collect_camera_prompts',
+            'OBJECT_OT_test_stable',
+            'OBJECT_OT_stablegen_reproject',
+            'OBJECT_OT_stablegen_regenerate',
+            'OBJECT_OT_stablegen_mirror_reproject',
+        }
+
+        wm = context.window_manager
+        for window in wm.windows:
+            for op in window.modal_operators:
+                if op.bl_idname in blocked_ids:
+                    return False
+
         return True
 
     def _mirror_image_file(
@@ -414,8 +436,6 @@ class MirrorReproject(bpy.types.Operator):
         flip_x: mirror horizontally (left/right)
         flip_y: mirror vertically   (top/bottom)
         """
-        import bpy
-
         os.makedirs(os.path.dirname(dst_path), exist_ok=True)
 
         img = bpy.data.images.load(src_path)
@@ -427,18 +447,15 @@ class MirrorReproject(bpy.types.Operator):
 
             # y in *destination* space
             for y in range(h):
-                # Find which source row we read from
                 src_y = h - 1 - y if flip_y else y
                 src_row_start = src_y * row_stride
                 dst_row_start = y * row_stride
 
                 # x in *destination* space
                 for x in range(w):
-                    # Find which source column we read from
                     src_x = w - 1 - x if flip_x else x
                     src_idx = src_row_start + src_x * 4
                     dst_idx = dst_row_start + x * 4
-
                     mirrored[dst_idx:dst_idx + 4] = pixels[src_idx:src_idx + 4]
 
             img.pixels[:] = mirrored
@@ -448,7 +465,6 @@ class MirrorReproject(bpy.types.Operator):
         finally:
             bpy.data.images.remove(img)
 
-
     def _mirror_camera_matrix(
         self,
         cam: bpy.types.Object,
@@ -457,49 +473,10 @@ class MirrorReproject(bpy.types.Operator):
         mirror_z: bool,
     ) -> mathutils.Matrix:
         """
-        Mirror a camera across the selected global axes (X=0, Y=0, Z=0 planes),
-        then rebuild a proper rotation so we don't end up with negative scale
-        / flipped handedness.
-
-        mirror_x: mirror across X=0 (YZ plane)
-        mirror_y: mirror across Y=0 (XZ plane)
-        mirror_z: mirror across Z=0 (XY plane)
+        Thin wrapper around _build_mirrored_camera_matrix so it can be used
+        from methods (and swapped if needed later).
         """
-        m = cam.matrix_world.copy()
-        loc = m.to_translation()
-        basis = m.to_3x3()
-
-        # Camera conventions: looks along local -Z, local +Y is "up"
-        forward = -(basis @ mathutils.Vector((0.0, 0.0, 1.0)))  # world-space view dir
-        up      =  (basis @ mathutils.Vector((0.0, 1.0, 0.0)))  # world-space up
-
-        # Reflection factors per axis
-        sx = -1.0 if mirror_x else 1.0
-        sy = -1.0 if mirror_y else 1.0
-        sz = -1.0 if mirror_z else 1.0
-
-        # Apply reflection to position and direction vectors
-        loc_m = mathutils.Vector((sx * loc.x, sy * loc.y, sz * loc.z))
-        f_m   = mathutils.Vector((sx * forward.x, sy * forward.y, sz * forward.z))
-        u_m   = mathutils.Vector((sx * up.x,      sy * up.y,      sz * up.z))
-
-        f = f_m.normalized()
-        u0 = u_m.normalized()
-
-        # Build an orthonormal basis: right, up, -forward
-        r = f.cross(u0)
-        if r.length < 1e-6:
-            # Degenerate case: fall back to world Z as "up"
-            r = f.cross(mathutils.Vector((0.0, 0.0, 1.0)))
-        r.normalize()
-        u = r.cross(f).normalized()
-
-        # Columns: X = right, Y = up, Z = -forward (camera looks along -Z)
-        ori3 = mathutils.Matrix((r, u, -f)).transposed()
-        ori4 = ori3.to_4x4()
-        ori4.translation = loc_m
-        return ori4
-
+        return _build_mirrored_camera_matrix(cam, mirror_x, mirror_y, mirror_z)
 
     def _get_to_texture(self, context):
         if context.scene.texture_objects == 'all':
@@ -535,7 +512,7 @@ class MirrorReproject(bpy.types.Operator):
         - Create a mirrored image for that camera in a NEW refine layer (material_id = base_id + 1).
         Then we call project_image once for that new layer.
         """
-        import shutil
+        import shutil  # (optionally move this to the top of the file)
 
         scene = context.scene
 
@@ -557,24 +534,35 @@ class MirrorReproject(bpy.types.Operator):
         orig_cam = scene.camera if scene.camera in cameras_orig else cameras_orig[0]
         src_cam_idx = cameras_orig.index(orig_cam)
 
-        # --- Mirror axes from Scene (UI toggles) ---
-        mirror_x_flag = getattr(scene, "stablegen_mirror_axis_x", True)
-        mirror_y_flag = getattr(scene, "stablegen_mirror_axis_y", False)
-        mirror_z_flag = getattr(scene, "stablegen_mirror_axis_z", False)
+        # --- Mirror axes from Scene (UI toggles), same pattern as standard mirror ---
+        axis_configs = [
+            (
+                "X",
+                getattr(scene, "stablegen_mirror_axis_x", True),
+                dict(mirror_x=True,  mirror_y=False, mirror_z=False),
+                (True, False),   # flip_x, flip_y
+            ),
+            (
+                "Y",
+                getattr(scene, "stablegen_mirror_axis_y", False),
+                dict(mirror_x=False, mirror_y=True,  mirror_z=False),
+                (False, True),
+            ),
+            (
+                "Z",
+                getattr(scene, "stablegen_mirror_axis_z", False),
+                dict(mirror_x=False, mirror_y=False, mirror_z=True),
+                (True, True),
+            ),
+        ]
 
-        axes_to_mirror = []
-        if mirror_x_flag:
-            axes_to_mirror.append("X")
-        if mirror_y_flag:
-            axes_to_mirror.append("Y")
-        if mirror_z_flag:
-            axes_to_mirror.append("Z")
-
+        axes_to_mirror = [cfg for cfg in axis_configs if cfg[1]]
         if not axes_to_mirror:
-            axes_to_mirror = ["X"]
+            # Safety: default to X only if everything is off
+            axes_to_mirror = [axis_configs[0]]
 
         # 3) Copy base layer images -> new refine layer for ALL original cameras
-        for cam_idx, cam_obj in enumerate(cameras_orig):
+        for cam_idx, _cam_obj in enumerate(cameras_orig):
             src_path = get_file_path(
                 context,
                 "generated",
@@ -589,12 +577,18 @@ class MirrorReproject(bpy.types.Operator):
             )
 
             if not os.path.exists(src_path):
-                print(f"[MirrorReproject] No base image for cam {cam_idx} at {src_path}, skipping copy.")
+                print(
+                    f"[MirrorReproject] No base image for cam {cam_idx} at {src_path}, "
+                    f"skipping copy."
+                )
                 continue
 
             os.makedirs(os.path.dirname(dst_path), exist_ok=True)
             shutil.copyfile(src_path, dst_path)
-            print(f"[MirrorReproject] Copied base image for cam {cam_idx}\n  {src_path}\n-> {dst_path}")
+            print(
+                f"[MirrorReproject] Copied base image for cam {cam_idx}\n"
+                f"  {src_path}\n-> {dst_path}"
+            )
 
         # We'll always mirror from the original camera's base image
         src_path_for_mirror = get_file_path(
@@ -606,41 +600,24 @@ class MirrorReproject(bpy.types.Operator):
         if not os.path.exists(src_path_for_mirror):
             self.report(
                 {'ERROR'},
-                f"No generated image found for active camera index {src_cam_idx} at:\n{src_path_for_mirror}"
+                (
+                    f"No generated image found for active camera index {src_cam_idx} at:\n"
+                    f"{src_path_for_mirror}"
+                ),
             )
             return {'CANCELLED'}
 
         created_cams = []
 
         # 4) For each selected axis, create a mirrored camera + mirrored image
-        for axis in axes_to_mirror:
+        for axis_name, _flag, matrix_kwargs, (flip_x, flip_y) in axes_to_mirror:
+            # Duplicate & mirror from the original camera
             mir_cam = orig_cam.copy()
             mir_cam.data = orig_cam.data.copy()
             scene.collection.objects.link(mir_cam)
 
-            if axis == "X":
-                mir_cam.matrix_world = self._mirror_camera_matrix(
-                    orig_cam,
-                    mirror_x=True,
-                    mirror_y=False,
-                    mirror_z=False,
-                )
-            elif axis == "Y":
-                mir_cam.matrix_world = self._mirror_camera_matrix(
-                    orig_cam,
-                    mirror_x=False,
-                    mirror_y=True,
-                    mirror_z=False,
-                )
-            elif axis == "Z":
-                mir_cam.matrix_world = self._mirror_camera_matrix(
-                    orig_cam,
-                    mirror_x=False,
-                    mirror_y=False,
-                    mirror_z=True,
-                )
-
-            mir_cam.name = f"{orig_cam.name}_MIRROR_{axis}"
+            mir_cam.matrix_world = self._mirror_camera_matrix(orig_cam, **matrix_kwargs)
+            mir_cam.name = f"{orig_cam.name}_MIRROR_{axis_name}"
             created_cams.append(mir_cam)
 
             # After linking, get its index in the updated camera list
@@ -653,15 +630,10 @@ class MirrorReproject(bpy.types.Operator):
                 camera_id=dst_cam_idx,
                 material_id=new_material_id,
             )
-
-            print(f"[MirrorReproject] Refine mirror ({axis})\n  {src_path_for_mirror}\n-> {dst_path}")
-
-            if axis == "X":
-                flip_x, flip_y = True, False
-            elif axis == "Y":
-                flip_x, flip_y = False, True
-            else:  # "Z"
-                flip_x, flip_y = True, True
+            print(
+                f"[MirrorReproject] Refine mirror ({axis_name})\n"
+                f"  {src_path_for_mirror}\n-> {dst_path}"
+            )
 
             self._mirror_image_file(
                 src_path_for_mirror,
@@ -680,16 +652,17 @@ class MirrorReproject(bpy.types.Operator):
             except Exception:
                 pass
 
+        axis_labels = ", ".join(cfg[0] for cfg in axes_to_mirror)
         self.report(
             {'INFO'},
-            f"Refine mirror applied as new layer (material id {new_material_id}) "
-            f"with {len(created_cams)} mirrored camera(s) ({', '.join(axes_to_mirror)}). "
-            f"Temporary cameras removed."
+            (
+                f"Refine mirror applied as new layer (material id {new_material_id}) "
+                f"with {len(created_cams)} mirrored camera(s) ({axis_labels}). "
+                f"Temporary cameras removed."
+            ),
         )
         return {'FINISHED'}
 
-
-    
     def _schedule_delete_camera_later(self, cam_name: str):
         """Delete the temporary camera after StableGen reprojection finishes."""
         import bpy
@@ -714,7 +687,7 @@ class MirrorReproject(bpy.types.Operator):
         """
         Standard / non-refine workflow:
         - For each selected axis (X / Y / Z), duplicate & mirror the active camera
-          around that single axis.
+        around that single axis.
         - For each mirrored camera, mirror the image on disk for the same material id.
         - Then let the existing Reproject operator do its thing once.
         """
@@ -737,22 +710,32 @@ class MirrorReproject(bpy.types.Operator):
         src_cam_idx = cameras.index(orig_cam)
 
         # --- Mirror axes from Scene (UI toggles) ---
-        mirror_x_flag = getattr(scene, "stablegen_mirror_axis_x", True)
-        mirror_y_flag = getattr(scene, "stablegen_mirror_axis_y", False)
-        mirror_z_flag = getattr(scene, "stablegen_mirror_axis_z", False)
+        axis_configs = [
+            (
+                "X",
+                getattr(scene, "stablegen_mirror_axis_x", True),
+                dict(mirror_x=True,  mirror_y=False, mirror_z=False),
+                (True, False),   # flip_x, flip_y
+            ),
+            (
+                "Y",
+                getattr(scene, "stablegen_mirror_axis_y", False),
+                dict(mirror_x=False, mirror_y=True,  mirror_z=False),
+                (False, True),
+            ),
+            (
+                "Z",
+                getattr(scene, "stablegen_mirror_axis_z", False),
+                dict(mirror_x=False, mirror_y=False, mirror_z=True),
+                (True, True),
+            ),
+        ]
 
-        # Build a list of axes we actually want to mirror
-        axes_to_mirror = []
-        if mirror_x_flag:
-            axes_to_mirror.append("X")
-        if mirror_y_flag:
-            axes_to_mirror.append("Y")
-        if mirror_z_flag:
-            axes_to_mirror.append("Z")
+        axes_to_mirror = [cfg for cfg in axis_configs if cfg[1]]
 
         # Safety: if user turned everything off, default back to X-only
         if not axes_to_mirror:
-            axes_to_mirror = ["X"]
+            axes_to_mirror = [axis_configs[0]]  # X
 
         # Source image for the active camera
         src_path = get_file_path(
@@ -764,42 +747,24 @@ class MirrorReproject(bpy.types.Operator):
         if not os.path.exists(src_path):
             self.report(
                 {'ERROR'},
-                f"No generated image found for active camera index {src_cam_idx} at:\n{src_path}"
+                (
+                    f"No generated image found for active camera index {src_cam_idx} at:\n"
+                    f"{src_path}"
+                ),
             )
             return {'CANCELLED'}
 
         created_cam_names = []
 
         # 3) For each selected axis, create a mirrored camera + mirrored image
-        for axis in axes_to_mirror:
-            # Duplicate & mirror camera from the *original* camera each time
+        for axis_name, _flag, matrix_kwargs, (flip_x, flip_y) in axes_to_mirror:
+            # Duplicate & mirror from the original camera each time
             mir_cam = orig_cam.copy()
             mir_cam.data = orig_cam.data.copy()
             scene.collection.objects.link(mir_cam)
 
-            if axis == "X":
-                mir_cam.matrix_world = self._mirror_camera_matrix(
-                    orig_cam,
-                    mirror_x=True,
-                    mirror_y=False,
-                    mirror_z=False,
-                )
-            elif axis == "Y":
-                mir_cam.matrix_world = self._mirror_camera_matrix(
-                    orig_cam,
-                    mirror_x=False,
-                    mirror_y=True,
-                    mirror_z=False,
-                )
-            elif axis == "Z":
-                mir_cam.matrix_world = self._mirror_camera_matrix(
-                    orig_cam,
-                    mirror_x=False,
-                    mirror_y=False,
-                    mirror_z=True,
-                )
-
-            mir_cam.name = f"{orig_cam.name}_MIRROR_{axis}"
+            mir_cam.matrix_world = self._mirror_camera_matrix(orig_cam, **matrix_kwargs)
+            mir_cam.name = f"{orig_cam.name}_MIRROR_{axis_name}"
             created_cam_names.append(mir_cam.name)
 
             # Rebuild sorted list so we know this mirrored camera's index
@@ -812,28 +777,21 @@ class MirrorReproject(bpy.types.Operator):
                 camera_id=dst_cam_idx,
                 material_id=base_id,
             )
-            print(f"[MirrorReproject] Standard mirror ({axis})\n  {src_path}\n-> {dst_path}")
+            print(
+                f"[MirrorReproject] Standard mirror ({axis_name})\n"
+                f"  {src_path}\n-> {dst_path}"
+            )
 
-            # Decide how to flip the image for this axis.
-            # X: horizontal, Y: vertical, Z: both (approximate 180° flip)
-            if axis == "X":
-                flip_x, flip_y = True, False
-            elif axis == "Y":
-                flip_x, flip_y = False, True
-            else:  # "Z"
-                flip_x, flip_y = True, True
-
+            # Flip image for this axis
             self._mirror_image_file(src_path, dst_path, flip_x=flip_x, flip_y=flip_y)
 
-        # 4) Hand off to the existing Reproject operator once,
-        #    which will rebuild the compare nodes / blending / UV assignment
-        #    for *all* cameras including the new mirrored ones.
+        # 4) Hand off to the existing Reproject operator once
         try:
             bpy.ops.object.stablegen_reproject('INVOKE_DEFAULT')
         except Exception as exc:
             self.report(
                 {'ERROR'},
-                f"Failed to start StableGen reprojection after mirroring: {exc}"
+                f"Failed to start StableGen reprojection after mirroring: {exc}",
             )
             return {'CANCELLED'}
 
@@ -841,15 +799,16 @@ class MirrorReproject(bpy.types.Operator):
         for cam_name in created_cam_names:
             self._schedule_delete_camera_later(cam_name)
 
+        axis_labels = ", ".join(cfg[0] for cfg in axes_to_mirror)
         self.report(
             {'INFO'},
-            f"Standard mirror: created {len(created_cam_names)} mirrored camera(s) "
-            f"({', '.join(axes_to_mirror)}), mirrored images, and started reprojection "
-            f"(temporary cameras will be removed afterwards)."
+            (
+                f"Standard mirror: created {len(created_cam_names)} mirrored camera(s) "
+                f"({axis_labels}), mirrored images, and started reprojection "
+                f"(temporary cameras will be removed afterwards)."
+            ),
         )
         return {'FINISHED'}
-
-
 
     def execute(self, context):
         scene = context.scene

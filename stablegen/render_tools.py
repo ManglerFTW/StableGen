@@ -31,32 +31,40 @@ def apply_vignette_to_mask(mask_file_path, feather_width=0.15, gamma=1.0):
                    0.0 = no blur, 0.5 = very soft edges.
     gamma: optional gamma applied to the blurred mask (1.0 = none).
     """
+    log_prefix = "[StableGen] Vignette:"
 
+    # -------------------------------------------------------------------------
+    # Basic guards
+    # -------------------------------------------------------------------------
     if feather_width <= 0.0:
         return
 
     if not isinstance(mask_file_path, str):
-        print(f"[StableGen] Vignette: mask_file_path must be a string, got {type(mask_file_path)}")
+        print(f"{log_prefix} mask_file_path must be a string, got {type(mask_file_path)}")
         return
+
     if not os.path.exists(mask_file_path):
-        print(f"[StableGen] Vignette: mask file not found: {mask_file_path}")
+        print(f"{log_prefix} mask file not found: {mask_file_path}")
         return
 
     img = cv2.imread(mask_file_path, cv2.IMREAD_GRAYSCALE)
     if img is None:
-        print(f"[StableGen] Vignette: failed to read mask: {mask_file_path}")
+        print(f"{log_prefix} failed to read mask: {mask_file_path}")
         return
 
+    # -------------------------------------------------------------------------
+    # Blur-based feathering
+    # -------------------------------------------------------------------------
     h, w = img.shape[:2]
     base = img.astype(np.float32) / 255.0
 
     # Radius as a fraction of the smallest dimension
     min_dim = float(min(h, w))
-    radius = int(max(1, feather_width * min_dim))
-    # Kernel size must be odd
-    ksize = max(3, radius | 1)
+    radius = max(1.0, feather_width * min_dim)
 
-    # Blur the mask: this softens *all* hard boundaries
+    # Kernel size must be odd and at least 3
+    ksize = int(max(3, int(radius) | 1))
+
     blurred = cv2.GaussianBlur(base, (ksize, ksize), 0)
 
     if gamma != 1.0:
@@ -65,10 +73,11 @@ def apply_vignette_to_mask(mask_file_path, feather_width=0.15, gamma=1.0):
     result = np.clip(blurred, 0.0, 1.0)
     result_u8 = (result * 255.0).astype(np.uint8)
     cv2.imwrite(mask_file_path, result_u8)
-    print(f"[StableGen] Soft-edge blur applied to mask: {mask_file_path} (ksize={ksize}, fw={feather_width}, gamma={gamma})")
 
-
-
+    print(
+        f"{log_prefix} soft-edge blur applied to mask: {mask_file_path} "
+        f"(ksize={ksize}, fw={feather_width}, gamma={gamma})"
+    )
 
 def apply_uv_inpaint_texture(context, obj, baked_image_path):
     """
@@ -143,115 +152,149 @@ def apply_uv_inpaint_texture(context, obj, baked_image_path):
     # Connect UV map node to texture node
     links.new(uv_map_node.outputs["UV"], tex_node.inputs["Vector"])
 
-def export_emit_image(context, to_export, camera_id=None,
-                      bg_color=(0.5, 0.5, 0.5),
-                      view_transform='Standard',
-                      fallback_color=(0, 0, 0)):
+def export_emit_image(
+    context,
+    to_export,
+    camera_id=None,
+    bg_color=(0.5, 0.5, 0.5),
+    view_transform="Standard",
+    fallback_color=(0, 0, 0),
+):
     """
     Exports an emit-only render of the scene from a camera's perspective.
     :param context: Blender context.
-    :param camera_id: ID of the camera.
+    :param to_export: Iterable of objects to process.
+    :param camera_id: ID of the camera or a string containing 'visibility' for mask renders.
     """
     print("Exporting emit render")
-    # Set animation frame to 1
-    bpy.context.scene.frame_set(1)
 
-    # Store original materials and create temporary ones
+    scene = context.scene
+    view_layer = context.view_layer
+    world = scene.world
+
+    # -------------------------------------------------------------------------
+    # Basic scene setup
+    # -------------------------------------------------------------------------
+    scene.frame_set(1)
+
+    if not world:
+        world = bpy.data.worlds.new("World")
+        scene.world = world
+
+    # Cache some original settings we *do* already restore in the original code
+    original_engine = scene.render.engine
+    original_film_transparent = scene.render.film_transparent
+    original_world_use_nodes = world.use_nodes
+    original_world_color = world.color.copy() if not world.use_nodes else None
+    original_view_transform = scene.view_settings.view_transform
+
+    # Precompute flags / strings
+    camera_id_str = "" if camera_id is None else str(camera_id)
+    is_visibility_render = "visibility" in camera_id_str
+
+    # -------------------------------------------------------------------------
+    # Material setup per object
+    # -------------------------------------------------------------------------
     original_materials = {}
     original_active_material = {}
     temporary_materials = {}
 
-    for obj in to_export:
+    def _setup_emit_material(obj):
+        """Copy active material, remap it for fallback background, and assign."""
+        mat = obj.active_material
+        if not mat:
+            return
+
         # Store original materials
         original_materials[obj] = list(obj.data.materials)
         original_active_material[obj] = obj.active_material
 
-        mat = obj.active_material
-        if not mat:
-            continue
-
+        # Create a temporary copy of the active material
         mat_copy = mat.copy()
+        temporary_materials[obj] = mat_copy
 
-        # Clear materials and assign temp material
+        # Replace all slots with the temp material
         obj.data.materials.clear()
         obj.data.materials.append(mat_copy)
 
-        # Store the temporary material for later deletion
-        temporary_materials[obj] = mat_copy
-
+        # Ensure node setup
         mat_copy.use_nodes = True
         nodes = mat_copy.node_tree.nodes
         links = mat_copy.node_tree.links
 
-        # Find the output node
+        # Find material output node
         output = None
         for node in nodes:
-            if node.type == 'OUTPUT_MATERIAL':
+            if node.type == "OUTPUT_MATERIAL":
                 output = node
                 break
 
-        if not output or not output.inputs[0].links:
-            continue
+        if not output:
+            return
+
+        if not output.inputs[0].links:
+            return
 
         before_output = output.inputs[0].links[0].from_node
 
-        if before_output.type == 'BSDF_PRINCIPLED':
-            # Find the last color mix node before the BSDF
+        # Figure out which node is the color mix we want to drive
+        if before_output.type == "BSDF_PRINCIPLED":
+            # Assuming the Color input is driven by a Mix node
+            if not before_output.inputs[0].links:
+                return
             color_mix = before_output.inputs[0].links[0].from_node
-            if "visibility" not in str(camera_id):
-                color_mix.inputs["Color2"].default_value = (
-                    fallback_color[0], fallback_color[1], fallback_color[2], 1.0
-                )
         else:
             # Already a color mix node feeding the output
             color_mix = before_output
-            if "visibility" not in str(camera_id):
-                color_mix.inputs["Color2"].default_value = (
-                    fallback_color[0], fallback_color[1], fallback_color[2], 1.0
-                )
-            # Connect and continue
-            links.new(color_mix.outputs[0], output.inputs[0])
-            continue
 
-        # Connect the color mix node directly to the output
+        # Only set fallback color if this is not a visibility render
+        if not is_visibility_render:
+            color_mix.inputs["Color2"].default_value = (
+                float(fallback_color[0]),
+                float(fallback_color[1]),
+                float(fallback_color[2]),
+                1.0,
+            )
+
+        # Ensure the color mix drives the output directly
         links.new(color_mix.outputs[0], output.inputs[0])
 
-    # Choose output directory based on whether this is a visibility render
-    output_dir = (
-        get_dir_path(context, "inpaint")["visibility"]
-        if "visibility" in str(camera_id)
-        else get_dir_path(context, "inpaint")["render"]
-    )
+    # Apply the temporary emit material setup
+    for obj in to_export:
+        # Only store materials for objects we actually touch
+        if obj not in original_materials:
+            original_materials[obj] = list(obj.data.materials)
+            original_active_material[obj] = obj.active_material
+        _setup_emit_material(obj)
+
+    # -------------------------------------------------------------------------
+    # Output path setup
+    # -------------------------------------------------------------------------
+    inpaint_paths = get_dir_path(context, "inpaint")
+    output_dir = inpaint_paths["visibility"] if is_visibility_render else inpaint_paths["render"]
     output_file = f"render{camera_id}" if camera_id is not None else "render"
 
-    # Store and set world settings
-    world = context.scene.world
-    if not world:
-        world = bpy.data.worlds.new("World")
-        context.scene.world = world
-
-    original_engine = context.scene.render.engine
-    original_film_transparent = context.scene.render.film_transparent
-    original_use_nodes = world.use_nodes
-    original_color = world.color.copy() if not world.use_nodes else None
-
-    # Flat background
-    world.color = bg_color
+    # -------------------------------------------------------------------------
+    # World & render settings for flat background and emit-only pass
+    # -------------------------------------------------------------------------
+    # Flat background, no world nodes
     world.use_nodes = False
+    world.color = bg_color
 
-    # Switch to CYCLES render engine and configure settings
-    context.scene.render.engine = 'CYCLES'
-    context.scene.cycles.use_osl = True
-    context.scene.cycles.device = 'CPU'
-    context.scene.render.film_transparent = False
+    render = scene.render
+    cycles = scene.cycles
+
+    render.engine = "CYCLES"
+    render.film_transparent = False
+    cycles.use_osl = True
+    cycles.device = "CPU"
+    cycles.samples = 1  # Minimum samples for speed
 
     # Color management
-    bpy.context.scene.display_settings.display_device = 'sRGB'
-    bpy.context.scene.view_settings.view_transform = view_transform
-    context.scene.cycles.samples = 1  # Minimum samples for speed
+    scene.display_settings.display_device = "sRGB"
+    scene.view_settings.view_transform = view_transform
 
-    # Configure view layer settings for emit-only
-    view_layer = context.view_layer
+    # Emit-only pass settings
     view_layer.use_pass_diffuse_color = False
     view_layer.use_pass_diffuse_direct = False
     view_layer.use_pass_diffuse_indirect = False
@@ -260,70 +303,85 @@ def export_emit_image(context, to_export, camera_id=None,
     view_layer.use_pass_emit = True
     view_layer.use_pass_environment = True
 
-    # Set up compositor
-    context.scene.use_nodes = True
-    nodes = context.scene.node_tree.nodes
-    links = context.scene.node_tree.links
+    # -------------------------------------------------------------------------
+    # Compositor setup
+    # -------------------------------------------------------------------------
+    scene.use_nodes = True
+    comp_tree = scene.node_tree
+    comp_nodes = comp_tree.nodes
+    comp_links = comp_tree.links
 
-    nodes.clear()
+    comp_nodes.clear()
 
-    render_layers = nodes.new('CompositorNodeRLayers')
-    mix_node = nodes.new('CompositorNodeMixRGB')
-    mix_node.blend_type = 'ADD'
+    render_layers = comp_nodes.new("CompositorNodeRLayers")
+
+    mix_node = comp_nodes.new("CompositorNodeMixRGB")
+    mix_node.blend_type = "ADD"
     mix_node.inputs[0].default_value = 1.0
 
-    output_node = nodes.new('CompositorNodeOutputFile')
+    output_node = comp_nodes.new("CompositorNodeOutputFile")
     output_node.base_path = output_dir
     output_node.file_slots[0].path = output_file
 
-    links.new(render_layers.outputs['Emit'], mix_node.inputs[1])
-    links.new(render_layers.outputs['Env'], mix_node.inputs[2])
-    links.new(mix_node.outputs[0], output_node.inputs[0])
+    comp_links.new(render_layers.outputs["Emit"], mix_node.inputs[1])
+    comp_links.new(render_layers.outputs["Env"], mix_node.inputs[2])
+    comp_links.new(mix_node.outputs[0], output_node.inputs[0])
 
+    # -------------------------------------------------------------------------
     # Render
+    # -------------------------------------------------------------------------
     bpy.ops.render.render(write_still=True)
 
     base_path = os.path.join(output_dir, f"{output_file}.png")
     final_path = base_path
 
-    if "visibility" in str(camera_id):
+    # -------------------------------------------------------------------------
+    # Post-processing for visibility masks
+    # -------------------------------------------------------------------------
+    if is_visibility_render:
         final_path = base_path.replace(".png", "0001.png")
 
-        if context.scene.visibility_vignette:
+        if scene.visibility_vignette:
             # Smooth edge feathering, no blocky mask
             apply_vignette_to_mask(
                 final_path,
-                feather_width=context.scene.visibility_vignette_width,
+                feather_width=scene.visibility_vignette_width,
                 gamma=1.0,
             )
-
-        elif context.scene.mask_blocky:
+        elif scene.mask_blocky:
             # Only do blocky mask if vignette is OFF
             expanded_mask = expand_mask_to_blocks(final_path, block_size=8)
             if expanded_mask is not None:
                 expanded_mask_u8 = (expanded_mask * 255).astype(np.uint8)
                 cv2.imwrite(final_path, expanded_mask_u8)
 
-    # Restore original settings
-    context.scene.render.engine = original_engine
-    context.scene.render.film_transparent = original_film_transparent
-    if original_use_nodes:
-        world.use_nodes = True
-    elif original_color:
-        world.color = original_color
-    bpy.context.scene.view_settings.view_transform = 'Standard'
+    # -------------------------------------------------------------------------
+    # Restore original scene settings (same behavior as original)
+    # -------------------------------------------------------------------------
+    render.engine = original_engine
+    render.film_transparent = original_film_transparent
 
-    # Restore original materials
+    if original_world_use_nodes:
+        world.use_nodes = True
+    elif original_world_color:
+        world.color = original_world_color
+
+    scene.view_settings.view_transform = original_view_transform
+
+    # Restore original materials and active material
     for obj, materials in original_materials.items():
         obj.data.materials.clear()
-        if original_active_material[obj]:
-            obj.data.materials.append(original_active_material[obj])
+
+        active_mat = original_active_material.get(obj)
+        if active_mat:
+            obj.data.materials.append(active_mat)
+
         for mat in materials:
-            if mat != original_active_material[obj]:
+            if mat is not active_mat:
                 obj.data.materials.append(mat)
 
     # Clean up temporary materials
-    for _, temp_mat in temporary_materials.items():
+    for temp_mat in temporary_materials.values():
         if temp_mat and temp_mat.name in bpy.data.materials:
             bpy.data.materials.remove(temp_mat)
 
